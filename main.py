@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Importa a liberação de CORS
 import re
 import smtplib
 import dns.resolver
 import time
 
 app = Flask(__name__)
+CORS(app)  # Isso libera o acesso direto pelo navegador (frontend da Base44)
 
 def validar_unico_email(email_destino):
     email_remetente = "teste@seudominio.com"
@@ -38,17 +40,24 @@ def validar_unico_email(email_destino):
     except Exception as e:
         return {"status": "inconclusivo", "motivo": "Erro de conexao SMTP"}
 
+# Rota principal para testes rápidos da IA da Base44
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"status": "servidor_ativo", "mensagem": "Use a rota /validar-lote via POST"})
+
+# Rota exata que a Base44 vai chamar
 @app.route('/validar-lote', methods=['POST'])
 def verificar_emails_em_lote():
     dados = request.get_json()
-    lista_emails = dados.get("emails", []) # Recebe uma lista de e-mails
+    if not dados:
+        return jsonify({"erro": "JSON invalido ou ausente"}), 400
+        
+    lista_emails = dados.get("emails", [])
     
     resultados = {}
-    
     for email in lista_emails:
         resultados[email] = validar_unico_email(email)
-        # Pausa de 1.5 segundos entre cada e-mail para evitar bloqueios
-        time.sleep(1.5) 
+        time.sleep(1.5)  # Pausa de segurança anti-spam
         
     return jsonify(resultados)
 
