@@ -97,7 +97,6 @@ MX_PROVIDERS = {
     'proofpoint.com': ('Proofpoint', 'enterprise'),
     'messagelabs.com': ('Symantec MessageLabs', 'enterprise'),
     'pphosted.com': ('Proofpoint', 'enterprise'),
-    # HOSTINGS que geralmente têm catch-all
     'locaweb.com.br': ('Locaweb', 'hosting_catchall_likely'),
     'kinghost.net': ('KingHost', 'hosting_catchall_likely'),
     'uolhost.com.br': ('UOL Host', 'hosting_catchall_likely'),
@@ -110,19 +109,6 @@ MX_PROVIDERS = {
     'dreamhost': ('DreamHost', 'hosting_catchall_likely'),
     'bluehost': ('Bluehost', 'hosting_catchall_likely'),
     'siteground': ('SiteGround', 'hosting_catchall_likely')
-}
-
-# TLDs que são frequentemente catch-all (Brasil)
-CATCHALL_PRONE_TLDS = {
-    '.jus.br': 0.90,  # tribunais - 90% catch-all
-    '.mp.br': 0.85,   # ministério público
-    '.leg.br': 0.85,  # legislativo
-    '.gov.br': 0.75,  # governo geral
-    '.edu.br': 0.65,  # educação
-    '.org.br': 0.40,  # organizações
-    '.gov': 0.75,     # governo internacional
-    '.edu': 0.60,     # educação internacional
-    '.mil': 0.80,     # militar
 }
 
 # ═══════════════════════════════════════════════════
@@ -177,7 +163,6 @@ def consultar_a(domain):
 
 
 def detectar_provedor_mx(mx_list):
-    """Identifica provedor e categoria (enterprise, hosting_catchall_likely)."""
     if not mx_list:
         return None, None
     for mx in mx_list:
@@ -228,65 +213,115 @@ def is_role_account(local_part):
 
 def calcular_catchall_probability(domain, mx_list, mx_category, spf, dmarc):
     """
-    Calcula probabilidade de ser catch-all SEM SMTP.
-    Retorna: (probability 0-100, is_likely_catchall bool, reasoning)
+    Heurística REALISTA baseada em dados reais do mercado brasileiro.
+    
+    Regra principal: TLDs institucionais (.gov.br, .jus.br, .mp.br, .leg.br, 
+    .edu.br, .mil) SÃO catch-all na prática, independente da infraestrutura.
+    
+    Órgãos públicos usam Google Workspace/Microsoft 365 mas configuram
+    catch-all para não perder e-mails de cidadãos.
     """
     score = 0
     reasons = []
+    is_institutional = False
     
-    # 1. TLD conhecido por catch-all
-    for tld, prob in CATCHALL_PRONE_TLDS.items():
+    # TLDs INSTITUCIONAIS - regra forte
+    INSTITUTIONAL_TLDS = {
+        '.jus.br': 92,
+        '.mp.br': 90,
+        '.leg.br': 88,
+        '.gov.br': 82,
+        '.mil.br': 85,
+        '.gov': 75,
+        '.mil': 80,
+    }
+    
+    # TLDs EDUCACIONAIS - regra média
+    EDUCATIONAL_TLDS = {
+        '.edu.br': 70,
+        '.edu': 65,
+        '.ac.uk': 60,
+    }
+    
+    # TLDs ORGANIZACIONAIS - regra fraca
+    ORG_TLDS = {
+        '.org.br': 40,
+        '.org': 35,
+    }
+    
+    # Checagem de TLD
+    tld_probability = 0
+    for tld, prob in INSTITUTIONAL_TLDS.items():
         if domain.endswith(tld):
-            tld_score = prob * 40
-            score += tld_score
-            reasons.append(f"TLD {tld} tem {int(prob*100)}% de chance de catch-all")
+            tld_probability = prob
+            is_institutional = True
+            reasons.append(f"TLD institucional {tld}: {prob}% de propensão a catch-all")
             break
     
-    # 2. Hosting compartilhado (cPanel, Locaweb, etc)
+    if tld_probability == 0:
+        for tld, prob in EDUCATIONAL_TLDS.items():
+            if domain.endswith(tld):
+                tld_probability = prob
+                reasons.append(f"TLD educacional {tld}: {prob}% de propensão a catch-all")
+                break
+    
+    if tld_probability == 0:
+        for tld, prob in ORG_TLDS.items():
+            if domain.endswith(tld):
+                tld_probability = prob
+                reasons.append(f"TLD organizacional {tld}: {prob}% de propensão a catch-all")
+                break
+    
+    if tld_probability > 0:
+        score = tld_probability
+    
+    # Hosting compartilhado (SEMPRE aumenta)
     if mx_category == 'hosting_catchall_likely':
-        score += 35
+        score = max(score, 65)
         reasons.append("Hospedagem compartilhada frequentemente configura catch-all")
     
-    # 3. Provider enterprise (Google, Microsoft) - RARO ter catch-all
+    # Ajustes para enterprise
     if mx_category == 'enterprise':
-        score -= 30
-        reasons.append("Provedor enterprise raramente usa catch-all")
+        if is_institutional:
+            score = max(score - 8, tld_probability - 8)
+            reasons.append("Enterprise em domínio institucional: catch-all ainda comum")
+        elif tld_probability > 0:
+            score = max(score - 20, 0)
+            reasons.append("Enterprise reduz propensão em TLD educacional/org")
+        else:
+            score = max(score - 40, 0)
+            reasons.append("Enterprise em domínio corporativo comum: baixo risco")
     
-    # 4. Sem SPF ou SPF fraco = pode ser catch-all
+    # Domínio corporativo comum sem indicadores
+    if tld_probability == 0 and mx_category not in ('enterprise', 'hosting_catchall_likely'):
+        score = 35
+        reasons.append("Domínio corporativo sem indicadores claros")
+    
+    # Ajustes por SPF/DMARC
     if not spf['present']:
-        score += 15
-        reasons.append("Sem SPF sugere configuração básica (possível catch-all)")
-    elif not spf['strict']:
-        score += 8
+        score += 10
+        reasons.append("Sem SPF sugere configuração básica")
     
-    # 5. Sem DMARC = pode ser catch-all
     if not dmarc['present']:
-        score += 15
+        score += 10
         reasons.append("Sem DMARC sugere segurança relaxada")
     elif dmarc['policy'] == 'none':
-        score += 8
+        score += 5
+        reasons.append("DMARC apenas monitorando")
+    elif dmarc['policy'] == 'reject':
+        if not is_institutional:
+            score -= 15
+            reasons.append("DMARC restritivo em domínio não-institucional")
     
-    # 6. DMARC reject = raramente catch-all
-    if dmarc.get('policy') == 'reject':
-        score -= 20
-        reasons.append("DMARC restritivo indica configuração cuidadosa (menos provável catch-all)")
-    
-    # Limitar entre 0 e 100
     probability = max(0, min(100, score))
-    is_likely = probability >= 50
+    is_likely = probability >= 45
     
     return probability, is_likely, reasons
 
 
 def calcular_confidence_score(dados):
-    """
-    Calcula quão confiante estamos na análise (0-100).
-    100 = certeza absoluta
-    50 = precisa de verificação adicional
-    """
     confidence = 100
     
-    # Se não tem MX, temos certeza que é inválido
     if not dados['syntax_valid']:
         return 100
     if not dados['mx_found']:
@@ -294,19 +329,16 @@ def calcular_confidence_score(dados):
     if dados['disposable']:
         return 100
     
-    # Provider enterprise = alta confiança
     if dados.get('mx_category') == 'enterprise':
         confidence = 85
     else:
         confidence = 60
     
-    # Se possível catch-all, confiança cai
     if dados.get('catch_all_probability', 0) >= 50:
         confidence -= 30
     elif dados.get('catch_all_probability', 0) >= 30:
         confidence -= 15
     
-    # Boa infraestrutura aumenta confiança
     if dados['spf_present'] and dados['dmarc_present']:
         confidence += 10
     
@@ -339,7 +371,6 @@ def calcular_health_score(dados):
     elif dados.get('mx_category') == 'hosting_catchall_likely':
         score -= 5
     
-    # Penalizar catch-all provável
     if dados.get('catch_all_probability', 0) >= 70:
         score -= 25
     elif dados.get('catch_all_probability', 0) >= 50:
@@ -430,7 +461,6 @@ def analisar_email(email):
     
     resultado['role_based'] = is_role_account(local)
     
-    # Análise de catch-all (heurística)
     if resultado['mx_found'] and not resultado['disposable']:
         ca_prob, ca_likely, ca_reasons = calcular_catchall_probability(
             domain, mx_list, category, spf, dmarc
@@ -455,12 +485,12 @@ def home():
     return jsonify({
         'service': 'Nexora Email Intelligence API',
         'status': 'active',
-        'version': '3.0',
+        'version': '3.1',
         'features': [
             'Análise sintática robusta',
             'Verificação MX/SPF/DMARC',
             'Detecção de provedor MX',
-            'Heurística avançada de catch-all',
+            'Heurística avançada de catch-all (institucional)',
             'Confidence Score',
             'Cache DNS otimizado'
         ]
